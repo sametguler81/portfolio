@@ -53,8 +53,12 @@ export default function ScrollHero() {
     const img = imagesRef.current[currentFrame];
     if (!img || !img.complete) return;
 
-    canvas.width = canvas.offsetWidth;
-    canvas.height = canvas.offsetHeight;
+    // Only resize the canvas when its display size actually changed.
+    // Re-assigning canvas.width/height every frame reallocates the buffer (jank).
+    if (canvas.width !== canvas.offsetWidth || canvas.height !== canvas.offsetHeight) {
+      canvas.width = canvas.offsetWidth;
+      canvas.height = canvas.offsetHeight;
+    }
 
     const imgWidth = img.naturalWidth || 1920;
     const imgHeight = img.naturalHeight || 1080;
