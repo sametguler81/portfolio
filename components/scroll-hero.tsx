@@ -11,20 +11,32 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { useT } from "@/components/i18n";
 
+const IMAGE_FRAME_COUNT = 240;
+const LOOKAHEAD = 28; // frames to keep decoded ahead of the playhead
+const BEHIND = 10; // frames to keep decoded behind
+const LERP = 0.18; // playhead smoothing toward scroll target
 const AUTO_ADVANCE_DELAY = 2400;
-const AUTO_SCROLL_SPEED = 240; // scroll px/sec when auto-advancing
+const AUTO_SCROLL_SPEED = 240;
+
+function frameSrc(frame: number) {
+  return `/video/frame_${String(frame).padStart(4, "0")}.jpg`;
+}
 
 export default function ScrollHero() {
   const { c } = useT();
   const FRAMES = c.hero.frames;
   const N = FRAMES.length;
   const ref = useRef<HTMLElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Scroll-scrubbed <video> — one hardware-decoded file, no per-frame JS work.
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const durationRef = useRef(0);
-  const targetTimeRef = useRef(0);
-  const seekRafRef = useRef(0);
+  // Pro image-sequence engine: off-thread decode (createImageBitmap) +
+  // a sliding window of decoded bitmaps (close() the rest) + rAF lerp loop.
+  const bitmaps = useRef<Map<number, ImageBitmap>>(new Map());
+  const loading = useRef<Set<number>>(new Set());
+  const targetFrameRef = useRef(1);
+  const displayFrameRef = useRef(1);
+  const lastDrawnRef = useRef(-1);
+  const rafRef = useRef(0);
 
   const { scrollYProgress } = useScroll({
     target: ref,
@@ -38,47 +50,127 @@ export default function ScrollHero() {
 
   const [sceneIndex, setSceneIndex] = useState(0);
 
-  // Move the video playhead toward the scroll target, coalesced to one seek/frame.
-  const scheduleSeek = () => {
-    if (seekRafRef.current) return;
-    seekRafRef.current = requestAnimationFrame(() => {
-      seekRafRef.current = 0;
-      const v = videoRef.current;
-      const d = durationRef.current;
-      if (!v || !d) return;
-      const t = Math.min(d - 0.05, Math.max(0, targetTimeRef.current));
-      if (Math.abs(v.currentTime - t) > 0.012) {
-        try {
-          v.currentTime = t;
-        } catch {
-          /* seek not ready yet */
-        }
-      }
-    });
-  };
-
-  // Prime the video: load metadata, get duration, unlock seeking (esp. iOS).
   useEffect(() => {
-    const v = videoRef.current;
-    if (!v) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d", { alpha: false });
+    if (!ctx) return;
+    let disposed = false;
 
-    const onMeta = () => {
-      durationRef.current = v.duration || 0;
-      // Muted + playsInline autoplay is allowed; play/pause primes seeking.
-      const p = v.play();
-      if (p && typeof p.then === "function") {
-        p.then(() => v.pause()).catch(() => {});
-      }
-      try {
-        v.currentTime = 0.0001;
-      } catch {
-        /* noop */
+    const loadFrame = (i: number) => {
+      if (i < 1 || i > IMAGE_FRAME_COUNT) return;
+      if (bitmaps.current.has(i) || loading.current.has(i)) return;
+      loading.current.add(i);
+      fetch(frameSrc(i))
+        .then((r) => r.blob())
+        .then((b) => createImageBitmap(b))
+        .then((bmp) => {
+          loading.current.delete(i);
+          if (disposed) {
+            bmp.close();
+            return;
+          }
+          bitmaps.current.set(i, bmp);
+          ensureLoop(); // a newly-ready frame may need to be drawn
+        })
+        .catch(() => loading.current.delete(i));
+    };
+
+    // Keep only frames near the playhead decoded; free the rest.
+    const ensureWindow = (center: number) => {
+      for (let i = center - BEHIND; i <= center + LOOKAHEAD; i++) loadFrame(i);
+      const lo = center - BEHIND - 6;
+      const hi = center + LOOKAHEAD + 6;
+      for (const [key, bmp] of bitmaps.current) {
+        if (key < lo || key > hi) {
+          bmp.close();
+          bitmaps.current.delete(key);
+        }
       }
     };
 
-    v.addEventListener("loadedmetadata", onMeta);
-    if (v.readyState >= 1) onMeta();
-    return () => v.removeEventListener("loadedmetadata", onMeta);
+    const nearestLoaded = (i: number): ImageBitmap | null => {
+      if (bitmaps.current.has(i)) return bitmaps.current.get(i)!;
+      for (let d = 1; d <= 16; d++) {
+        if (bitmaps.current.has(i - d)) return bitmaps.current.get(i - d)!;
+        if (bitmaps.current.has(i + d)) return bitmaps.current.get(i + d)!;
+      }
+      return null;
+    };
+
+    const draw = (frameIdx: number) => {
+      const bmp = nearestLoaded(frameIdx);
+      if (!bmp) return false;
+
+      const cw = canvas.offsetWidth;
+      const ch = canvas.offsetHeight;
+      if (canvas.width !== cw || canvas.height !== ch) {
+        canvas.width = cw;
+        canvas.height = ch;
+      }
+      const ir = bmp.width / bmp.height;
+      const cr = cw / ch;
+      let dw = cw,
+        dh = ch,
+        ox = 0,
+        oy = 0;
+      if (ir > cr) {
+        dw = ch * ir;
+        ox = (cw - dw) / 2;
+      } else {
+        dh = cw / ir;
+        oy = (ch - dh) / 2;
+      }
+      ctx.drawImage(bmp, ox, oy, dw, dh);
+      return true;
+    };
+
+    const tick = () => {
+      rafRef.current = 0;
+      const target = targetFrameRef.current;
+      let display = displayFrameRef.current;
+      display += (target - display) * LERP;
+      if (Math.abs(target - display) < 0.01) display = target;
+      displayFrameRef.current = display;
+
+      const frameIdx = Math.min(IMAGE_FRAME_COUNT, Math.max(1, Math.round(display)));
+      ensureWindow(frameIdx);
+
+      if (frameIdx !== lastDrawnRef.current) {
+        if (draw(frameIdx)) lastDrawnRef.current = frameIdx;
+      }
+
+      // keep looping while still easing toward target
+      if (Math.abs(target - display) >= 0.01) ensureLoop();
+    };
+
+    const ensureLoop = () => {
+      if (rafRef.current || disposed) return;
+      rafRef.current = requestAnimationFrame(tick);
+    };
+
+    // expose for scroll handler + resize via refs on the canvas element
+    (canvas as any).__ensureLoop = ensureLoop;
+
+    // initial: load the opening window and paint frame 1 once ready
+    ensureWindow(1);
+    ensureLoop();
+
+    const onResize = () => {
+      lastDrawnRef.current = -1; // force redraw at new size
+      ensureLoop();
+    };
+    window.addEventListener("resize", onResize);
+
+    return () => {
+      disposed = true;
+      window.removeEventListener("resize", onResize);
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      for (const bmp of bitmaps.current.values()) bmp.close();
+      bitmaps.current.clear();
+      loading.current.clear();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Auto-advance: gently scroll the pinned hero when the user is idle.
@@ -189,10 +281,9 @@ export default function ScrollHero() {
     const nextScene = Math.min(N - 1, Math.max(0, Math.round(v * (N - 1))));
     setSceneIndex((current) => (current === nextScene ? current : nextScene));
 
-    if (durationRef.current) {
-      targetTimeRef.current = v * durationRef.current;
-      scheduleSeek();
-    }
+    targetFrameRef.current = 1 + v * (IMAGE_FRAME_COUNT - 1);
+    const cv = canvasRef.current as any;
+    if (cv && cv.__ensureLoop) cv.__ensureLoop();
   });
 
   const barWidth = useTransform(progress, [0, 1], ["0%", "100%"]);
@@ -209,16 +300,11 @@ export default function ScrollHero() {
     <section className="scroll-hero" ref={ref} id="top">
       <div className="sh-stage">
         <motion.div className="sh-bg" style={{ scale: imageScale, x: imageX, y: imageY }}>
-          <video
-            ref={videoRef}
+          <canvas
+            ref={canvasRef}
             className="sh-frame"
-            muted
-            playsInline
-            preload="auto"
             style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
-          >
-            <source src="/hero.mp4" type="video/mp4" />
-          </video>
+          />
         </motion.div>
         <motion.div
           className="sh-glow"
@@ -227,14 +313,12 @@ export default function ScrollHero() {
         />
         <div className="sh-vignette" />
 
-        {/* top meta row */}
         <div className="sh-top wrap">
           <span>{c.hero.meta[0]}</span>
           {c.hero.meta[1] && <span className="sh-top-mid">{c.hero.meta[1]}</span>}
           {c.hero.meta[2] && <span>{c.hero.meta[2]}</span>}
         </div>
 
-        {/* center caption — crossfades per scene */}
         <div className="sh-center wrap">
           <AnimatePresence mode="wait">
             <motion.div
@@ -276,7 +360,6 @@ export default function ScrollHero() {
           </AnimatePresence>
         </div>
 
-        {/* bottom bar: progress + hint */}
         <div className="sh-bottom wrap">
           <div className="sh-progress">
             <motion.div className="sh-progress-fill" style={{ width: barWidth }} />
