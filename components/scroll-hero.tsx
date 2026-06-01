@@ -11,25 +11,20 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { useT } from "@/components/i18n";
 
-const IMAGE_FRAME_COUNT = 240;
-const FIRST_PRELOAD_COUNT = 18;
-const PRELOAD_RADIUS = 4;
 const AUTO_ADVANCE_DELAY = 2400;
-const AUTO_SCROLL_SPEED = 240; // scroll px/sec (independent of frame count)
-
-function frameSrc(frame: number) {
-  return `/video/frame_${String(frame).padStart(4, "0")}.jpg`;
-}
+const AUTO_SCROLL_SPEED = 240; // scroll px/sec when auto-advancing
 
 export default function ScrollHero() {
   const { c } = useT();
   const FRAMES = c.hero.frames;
   const N = FRAMES.length;
   const ref = useRef<HTMLElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const imagesRef = useRef<HTMLImageElement[]>([]);
-  const imageFrameRef = useRef(1);
-  const rafRef = useRef(0);
+
+  // Scroll-scrubbed <video> — one hardware-decoded file, no per-frame JS work.
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const durationRef = useRef(0);
+  const targetTimeRef = useRef(0);
+  const seekRafRef = useRef(0);
 
   const { scrollYProgress } = useScroll({
     target: ref,
@@ -43,84 +38,50 @@ export default function ScrollHero() {
 
   const [sceneIndex, setSceneIndex] = useState(0);
 
-  const drawImageToCanvas = () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    const currentFrame = imageFrameRef.current;
-    const img = imagesRef.current[currentFrame];
-    if (!img || !img.complete) return;
-
-    // Only resize the canvas when its display size actually changed.
-    // Re-assigning canvas.width/height every frame reallocates the buffer (jank).
-    if (canvas.width !== canvas.offsetWidth || canvas.height !== canvas.offsetHeight) {
-      canvas.width = canvas.offsetWidth;
-      canvas.height = canvas.offsetHeight;
-    }
-
-    const imgWidth = img.naturalWidth || 1920;
-    const imgHeight = img.naturalHeight || 1080;
-    const canvasWidth = canvas.width;
-    const canvasHeight = canvas.height;
-
-    const imgRatio = imgWidth / imgHeight;
-    const canvasRatio = canvasWidth / canvasHeight;
-
-    let drawWidth = canvasWidth;
-    let drawHeight = canvasHeight;
-    let offsetX = 0;
-    let offsetY = 0;
-
-    if (imgRatio > canvasRatio) {
-      drawWidth = canvasHeight * imgRatio;
-      offsetX = (canvasWidth - drawWidth) / 2;
-    } else {
-      drawHeight = canvasWidth / imgRatio;
-      offsetY = (canvasHeight - drawHeight) / 2;
-    }
-
-    ctx.clearRect(0, 0, canvasWidth, canvasHeight);
-    ctx.drawImage(img, offsetX, offsetY, drawWidth, drawHeight);
-  };
-
-  // Coalesce draws into a single requestAnimationFrame so fast scrolling
-  // never triggers more than one canvas paint per frame.
-  const scheduleDraw = () => {
-    if (rafRef.current) return;
-    rafRef.current = requestAnimationFrame(() => {
-      rafRef.current = 0;
-      drawImageToCanvas();
+  // Move the video playhead toward the scroll target, coalesced to one seek/frame.
+  const scheduleSeek = () => {
+    if (seekRafRef.current) return;
+    seekRafRef.current = requestAnimationFrame(() => {
+      seekRafRef.current = 0;
+      const v = videoRef.current;
+      const d = durationRef.current;
+      if (!v || !d) return;
+      const t = Math.min(d - 0.05, Math.max(0, targetTimeRef.current));
+      if (Math.abs(v.currentTime - t) > 0.012) {
+        try {
+          v.currentTime = t;
+        } catch {
+          /* seek not ready yet */
+        }
+      }
     });
   };
 
+  // Prime the video: load metadata, get duration, unlock seeking (esp. iOS).
   useEffect(() => {
-    // Preload + pre-decode every frame so drawImage never decodes on the main
-    // thread during scroll (the main source of stutter).
-    for (let i = 1; i <= IMAGE_FRAME_COUNT; i++) {
-      const img = new window.Image();
-      img.decoding = "async";
-      img.src = frameSrc(i);
-      const onReady = () => {
-        if (i === imageFrameRef.current) scheduleDraw();
-      };
-      // decode() resolves once the bitmap is ready to paint instantly
-      img.onload = () => {
-        if (img.decode) {
-          img.decode().then(onReady).catch(onReady);
-        } else {
-          onReady();
-        }
-      };
-      imagesRef.current[i] = img;
-    }
+    const v = videoRef.current;
+    if (!v) return;
 
-    window.addEventListener("resize", scheduleDraw);
-    return () => window.removeEventListener("resize", scheduleDraw);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    const onMeta = () => {
+      durationRef.current = v.duration || 0;
+      // Muted + playsInline autoplay is allowed; play/pause primes seeking.
+      const p = v.play();
+      if (p && typeof p.then === "function") {
+        p.then(() => v.pause()).catch(() => {});
+      }
+      try {
+        v.currentTime = 0.0001;
+      } catch {
+        /* noop */
+      }
+    };
+
+    v.addEventListener("loadedmetadata", onMeta);
+    if (v.readyState >= 1) onMeta();
+    return () => v.removeEventListener("loadedmetadata", onMeta);
   }, []);
 
+  // Auto-advance: gently scroll the pinned hero when the user is idle.
   useEffect(() => {
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
     if (reduceMotion.matches) return;
@@ -133,7 +94,6 @@ export default function ScrollHero() {
     const getHeroScrollRange = () => {
       const el = ref.current;
       if (!el) return null;
-
       const top = window.scrollY + el.getBoundingClientRect().top;
       const end = top + el.offsetHeight - window.innerHeight;
       return { top, end };
@@ -146,60 +106,44 @@ export default function ScrollHero() {
       frameId = 0;
     };
 
+    const goToAbout = () => {
+      const aboutEl = document.getElementById("about");
+      if (aboutEl) aboutEl.scrollIntoView({ behavior: "smooth" });
+    };
+
     const step = (time: number) => {
       if (!isRunning) return;
-
       const range = getHeroScrollRange();
       if (!range) {
         stopAutoAdvance();
         return;
       }
-
       const currentY = window.scrollY;
       if (currentY < range.top - 1 || currentY >= range.end - 1) {
-        if (currentY >= range.end - 1) {
-          const aboutEl = document.getElementById("about");
-          if (aboutEl) {
-            aboutEl.scrollIntoView({ behavior: "smooth" });
-          }
-        }
+        if (currentY >= range.end - 1) goToAbout();
         stopAutoAdvance();
         return;
       }
-
       if (lastTime !== null) {
         const distance = ((time - lastTime) / 1000) * AUTO_SCROLL_SPEED;
         const nextY = Math.min(range.end, currentY + distance);
-        window.scrollTo({
-          top: nextY,
-          behavior: "instant",
-        });
-
+        window.scrollTo({ top: nextY, behavior: "instant" });
         if (nextY >= range.end - 1) {
           stopAutoAdvance();
-          setTimeout(() => {
-            const aboutEl = document.getElementById("about");
-            if (aboutEl) {
-              aboutEl.scrollIntoView({ behavior: "smooth" });
-            }
-          }, 50);
+          setTimeout(goToAbout, 50);
           return;
         }
       }
-
       lastTime = time;
       frameId = window.requestAnimationFrame(step);
     };
 
     const startAutoAdvance = () => {
       if (isRunning) return;
-
       const range = getHeroScrollRange();
       if (!range) return;
-
       const currentY = window.scrollY;
       if (currentY < range.top - 1 || currentY >= range.end - 1) return;
-
       isRunning = true;
       lastTime = null;
       frameId = window.requestAnimationFrame(step);
@@ -243,17 +187,11 @@ export default function ScrollHero() {
 
   useMotionValueEvent(scrollYProgress, "change", (v) => {
     const nextScene = Math.min(N - 1, Math.max(0, Math.round(v * (N - 1))));
-    const nextFrame = Math.min(
-      IMAGE_FRAME_COUNT,
-      Math.max(1, Math.round(v * (IMAGE_FRAME_COUNT - 1)) + 1)
-    );
-
     setSceneIndex((current) => (current === nextScene ? current : nextScene));
 
-    // Draw imperatively (no React state) to keep the scroll hot-path light.
-    if (nextFrame !== imageFrameRef.current) {
-      imageFrameRef.current = nextFrame;
-      scheduleDraw();
+    if (durationRef.current) {
+      targetTimeRef.current = v * durationRef.current;
+      scheduleSeek();
     }
   });
 
@@ -271,11 +209,16 @@ export default function ScrollHero() {
     <section className="scroll-hero" ref={ref} id="top">
       <div className="sh-stage">
         <motion.div className="sh-bg" style={{ scale: imageScale, x: imageX, y: imageY }}>
-          <canvas
-            ref={canvasRef}
+          <video
+            ref={videoRef}
             className="sh-frame"
+            muted
+            playsInline
+            preload="auto"
             style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
-          />
+          >
+            <source src="/hero.mp4" type="video/mp4" />
+          </video>
         </motion.div>
         <motion.div
           className="sh-glow"
@@ -291,7 +234,7 @@ export default function ScrollHero() {
           {c.hero.meta[2] && <span>{c.hero.meta[2]}</span>}
         </div>
 
-        {/* center caption — crossfades per frame */}
+        {/* center caption — crossfades per scene */}
         <div className="sh-center wrap">
           <AnimatePresence mode="wait">
             <motion.div
@@ -299,7 +242,6 @@ export default function ScrollHero() {
               exit={{ opacity: 0, transition: { duration: 0.25, ease: "easeInOut" } }}
               className="sh-caption"
             >
-              {/* kicker animates from TOP */}
               <motion.span
                 className="sh-kicker mono"
                 initial={{ opacity: 0, y: -24 }}
@@ -311,7 +253,6 @@ export default function ScrollHero() {
               </motion.span>
 
               <h1 className="serif" style={{ display: "flex", flexDirection: "column", alignItems: "flex-start" }}>
-                {/* word animates from LEFT */}
                 <motion.span
                   initial={{ opacity: 0, x: -50 }}
                   animate={{ opacity: 1, x: 0 }}
@@ -321,7 +262,6 @@ export default function ScrollHero() {
                   {active.word}
                 </motion.span>
 
-                {/* line animates from RIGHT */}
                 <motion.span
                   className="sh-line"
                   initial={{ opacity: 0, x: 50 }}
@@ -341,7 +281,6 @@ export default function ScrollHero() {
           <div className="sh-progress">
             <motion.div className="sh-progress-fill" style={{ width: barWidth }} />
           </div>
-
           <div className="sh-hint mono">
             <span className="sh-hint-dot" />
             {c.hero.hint}
