@@ -11,7 +11,7 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { useT } from "@/components/i18n";
 
-const IMAGE_FRAME_COUNT = 120;
+const IMAGE_FRAME_COUNT = 240;
 const FIRST_PRELOAD_COUNT = 18;
 const PRELOAD_RADIUS = 4;
 const AUTO_ADVANCE_DELAY = 2400;
