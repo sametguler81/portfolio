@@ -29,6 +29,7 @@ export default function ScrollHero() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imagesRef = useRef<HTMLImageElement[]>([]);
   const imageFrameRef = useRef(1);
+  const rafRef = useRef(0);
 
   const { scrollYProgress } = useScroll({
     target: ref,
@@ -41,7 +42,6 @@ export default function ScrollHero() {
   });
 
   const [sceneIndex, setSceneIndex] = useState(0);
-  const [imageFrame, setImageFrame] = useState(1);
 
   const drawImageToCanvas = () => {
     const canvas = canvasRef.current;
@@ -85,27 +85,41 @@ export default function ScrollHero() {
     ctx.drawImage(img, offsetX, offsetY, drawWidth, drawHeight);
   };
 
+  // Coalesce draws into a single requestAnimationFrame so fast scrolling
+  // never triggers more than one canvas paint per frame.
+  const scheduleDraw = () => {
+    if (rafRef.current) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = 0;
+      drawImageToCanvas();
+    });
+  };
+
   useEffect(() => {
-    // Preload all 100 images sequentially in the background
+    // Preload + pre-decode every frame so drawImage never decodes on the main
+    // thread during scroll (the main source of stutter).
     for (let i = 1; i <= IMAGE_FRAME_COUNT; i++) {
       const img = new window.Image();
+      img.decoding = "async";
       img.src = frameSrc(i);
+      const onReady = () => {
+        if (i === imageFrameRef.current) scheduleDraw();
+      };
+      // decode() resolves once the bitmap is ready to paint instantly
       img.onload = () => {
-        if (i === imageFrameRef.current) {
-          drawImageToCanvas();
+        if (img.decode) {
+          img.decode().then(onReady).catch(onReady);
+        } else {
+          onReady();
         }
       };
       imagesRef.current[i] = img;
     }
 
-    window.addEventListener("resize", drawImageToCanvas);
-    return () => window.removeEventListener("resize", drawImageToCanvas);
+    window.addEventListener("resize", scheduleDraw);
+    return () => window.removeEventListener("resize", scheduleDraw);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  useEffect(() => {
-    imageFrameRef.current = imageFrame;
-    drawImageToCanvas();
-  }, [imageFrame]);
 
   useEffect(() => {
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -235,7 +249,12 @@ export default function ScrollHero() {
     );
 
     setSceneIndex((current) => (current === nextScene ? current : nextScene));
-    setImageFrame((current) => (current === nextFrame ? current : nextFrame));
+
+    // Draw imperatively (no React state) to keep the scroll hot-path light.
+    if (nextFrame !== imageFrameRef.current) {
+      imageFrameRef.current = nextFrame;
+      scheduleDraw();
+    }
   });
 
   const barWidth = useTransform(progress, [0, 1], ["0%", "100%"]);
@@ -247,7 +266,6 @@ export default function ScrollHero() {
   const glowY = useTransform(scrollYProgress, [0, 1], ["28%", "68%"]);
 
   const active = FRAMES[sceneIndex];
-  const imagePath = frameSrc(imageFrame);
 
   return (
     <section className="scroll-hero" ref={ref} id="top">
