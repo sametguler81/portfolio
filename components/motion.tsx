@@ -88,7 +88,9 @@ export function Counter({
   suffix?: string;
 }) {
   const ref = useRef<HTMLSpanElement>(null);
-  const inView = useInView(ref, { once: true, margin: "-20%" });
+  // Only constrain vertically. A 4-sided "-20%" excludes the left edge, so on
+  // mobile (single column, numbers near the left) it never triggered.
+  const inView = useInView(ref, { once: true, margin: "0px 0px -15% 0px" });
   const mv = useMotionValue(0);
   const [val, setVal] = useState(0);
 
